@@ -2,4 +2,5 @@ pandas
 requests
 python-telegram-bot
 flask
-tvdatafeed
+-e ./tvDatafeed
+
