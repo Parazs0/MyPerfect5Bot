@@ -4,3 +4,4 @@ python-telegram-bot
 flask
 ta
 python-dotenv
+websocket-client
