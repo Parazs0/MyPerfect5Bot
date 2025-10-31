@@ -1,4 +1,7 @@
 # save as perfect5_signal_bot.py
+import sys
+sys.path.append('./tvDatafeed')
+
 import os
 import time
 import pandas as pd
