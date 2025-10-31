@@ -1,0 +1,1 @@
+# TradingView CSV -> Telegram Bot\n\nPut your CSV at /data/signals.csv and your watchlist at /data/ALL_WATCHLIST_SYMBOLS.csv.\n
