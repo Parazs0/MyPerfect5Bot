@@ -222,7 +222,7 @@ def scan_loop():
         log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')}")
         for sym in symbols:
             calculate_signals(sym)
-            time.sleep(6)
+            time.sleep(2)
         log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting {SCAN_INTERVAL_SECONDS}s...")
         time.sleep(SCAN_INTERVAL_SECONDS)
 
