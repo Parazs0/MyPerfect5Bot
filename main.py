@@ -24,7 +24,7 @@ TV_PASSWORD = os.getenv("TV_PASSWORD")
 TV_COOKIES_BASE64 = os.getenv("TV_COOKIES_BASE64")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-SCAN_INTERVAL_SECONDS = 120  # scan every 2 min
+SCAN_INTERVAL_SECONDS = 1800  # scan every 30 min
 
 # -----------------------------
 # Telegram sender
@@ -222,7 +222,7 @@ def scan_loop():
         log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')}")
         for sym in symbols:
             calculate_signals(sym)
-            time.sleep(0.4)
+            time.sleep(6)
         log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting {SCAN_INTERVAL_SECONDS}s...")
         time.sleep(SCAN_INTERVAL_SECONDS)
 
