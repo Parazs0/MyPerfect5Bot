@@ -1,10 +1,42 @@
-# Ignore virtual environment
+# ====================================
+# 🔒 Python Virtual Environment
+# ====================================
 .venv/
+venv/
+env/
 
-# Ignore environment files
+# ====================================
+# 🔒 Environment and Secrets
+# ====================================
 .env
+*.env
+.env.*
+cookies.b64.txt
+tradingview_cookies.json
 
-# Ignore pycache and logs
+# ====================================
+# 🐍 Python Cache + Build Files
+# ====================================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# ====================================
+# 🧾 Logs and Temp Files
+# ====================================
 *.log
+*.tmp
+*.bak
+signals_log.txt
+
+# ====================================
+# 💻 IDE / OS Specific Files
+# ====================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
