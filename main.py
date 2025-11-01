@@ -1,5 +1,5 @@
-# main.py — Perfect5Bot: Scan 96 candles, send ONLY LATEST signal
-import os, json, logging, threading, time
+# main.py — Perfect5Bot: Stable, Authenticated, No Timeouts
+import os, base64, json, logging, threading, time
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 import pandas as pd
@@ -7,6 +7,7 @@ import requests
 from tvDatafeed import TvDatafeed, Interval
 from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
+import pickle
 
 # -----------------------------
 # Logging
@@ -21,14 +22,14 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "3"))
-SLEEP_BETWEEN_SCANS = float(os.getenv("SLEEP_BETWEEN_SCANS", "180"))
+PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "5"))
+SLEEP_BETWEEN_SCANS = float(os.getenv("SLEEP_BETWEEN_SCANS", "300"))
 N_BARS = int(os.getenv("N_BARS", "96"))
 
 FALLBACK_EXCHANGES = ["NSE","BSE","MCX","TVC","INDEX","OANDA","SKILLING","CAPITALCOM","VANTAGE","IG","SPREADEX","SZSE","NSEIX"]
 
-# Global: Prevent duplicate signals within 25 minutes (for 30min TF)
-last_signal_sent = {}  # {symbol_key: datetime}
+# Global: Prevent duplicate signals within 25 minutes
+last_signal_sent = {}
 
 # -----------------------------
 # Telegram helper
@@ -61,14 +62,50 @@ symbols = symbols_df["SYMBOL"].dropna().astype(str).tolist()
 log.info("Loaded %d symbols from CSV", len(symbols))
 
 # -----------------------------
-# tvDatafeed init
+# tvDatafeed init with cookies.b64.txt (Render Ready)
 # -----------------------------
-try:
+COOKIES_B64_FILE = "cookies.b64.txt"
+
+def init_tv():
+    global tv
+
+    # 1. Try loading from cookies.b64.txt
+    if os.path.exists(COOKIES_B64_FILE):
+        try:
+            with open(COOKIES_B64_FILE, 'r') as f:
+                b64_data = f.read().strip()
+            cookies_data = base64.b64decode(b64_data)
+            cookies = pickle.loads(cookies_data)
+            tv = TvDatafeed(cookies=cookies)
+            log.info("tvDatafeed loaded from cookies.b64.txt (authenticated)")
+            return
+        except Exception as e:
+            log.warning("Failed to load cookies.b64.txt: %s", e)
+
+    # 2. Fallback: Try login with env vars
+    username = os.getenv("TV_USERNAME")
+    password = os.getenv("TV_PASSWORD")
+    if username and password:
+        try:
+            tv = TvDatafeed(username=username, password=password)
+            try:
+                cookies_data = pickle.dumps(tv.cookies)
+                b64_data = base64.b64encode(cookies_data).decode('utf-8')
+                with open(COOKIES_B64_FILE, 'w') as f:
+                    f.write(b64_data)
+                log.info("Logged in & cookies saved to cookies.b64.txt")
+            except Exception as save_e:
+                log.warning("Could not save cookies.b64.txt: %s", save_e)
+            return
+        except Exception as e:
+            log.warning("Login failed: %s", e)
+
+    # 3. Final fallback: nologin
+    log.warning("No cookies/login → using nologin mode (may timeout)")
     tv = TvDatafeed()
-    log.info("tvDatafeed initialized (nologin mode).")
-except Exception as e:
-    log.warning("tvDatafeed init failed: %s", e)
-    tv = TvDatafeed()
+
+# === CALL INIT (ONLY ONCE) ===
+init_tv()
 
 # === SYMBOL PARSER ===
 def parse_symbol(raw: str):
@@ -100,13 +137,13 @@ def try_get_hist(tvc, symbol, exchange, interval, n_bars):
                 return df, ex
         except Exception as e:
             last_exc = e
-            log.debug("get_hist failed for %s @ %s: %s", symbol, ex, e)
+            log.debug("get_hist failed for %s @ %s: %s", symbol, ex or "None", e)
             continue
     if last_exc: raise last_exc
     return None, None
 
 # -----------------------------
-# Supertrend (Pine-like)
+# Supertrend function
 # -----------------------------
 def compute_supertrend(df, period=10, multiplier=3.0):
     df_local = df.copy().reset_index(drop=True)
@@ -160,13 +197,12 @@ def calculate_signals(raw_symbol: str):
         sym_token = str(sym_token).strip()
         if not sym_token: return
 
-        # --- Get data ---
         df, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
         if df is None or df.empty:
             log.debug("No data for %s", raw_symbol)
             return
 
-        # --- Normalize ---
+        # Normalize
         if 'datetime' not in df.columns:
             if isinstance(df.index, pd.DatetimeIndex):
                 df = df.copy()
@@ -185,16 +221,15 @@ def calculate_signals(raw_symbol: str):
             log.debug("Insufficient bars for %s (len=%d)", raw_symbol, len(df))
             return
 
-        # --- Indicators ---
+        # Indicators
         ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
-        ema50 = EMAIndicator(df["close"], window=50).ema_indicator()
         super_series, _ = compute_supertrend(df, period=10, multiplier=3.0)
         atr_series = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
 
         display = f"{used_ex or ex_token}:{sym_token}"
         key = f"{used_ex or ex_token}:{sym_token}"
 
-        # --- Find LATEST crossover in last N_BARS ---
+        # Find LATEST crossover
         start_idx = max(1, len(df) - N_BARS)
         end_idx = len(df)
 
@@ -237,12 +272,11 @@ def calculate_signals(raw_symbol: str):
                 log.debug("Error in bar %d for %s: %s", i, display, e)
                 continue
 
-        # --- SEND ONLY LATEST SIGNAL ---
+        # SEND ONLY LATEST SIGNAL
         if latest_buy or latest_sell:
             close_now, atr_now = (latest_buy or latest_sell)
             is_buy = latest_buy is not None
 
-            # IST Time
             if pd.isna(latest_time):
                 signal_time_ist = datetime.utcnow().strftime("%d-%b %H:%M")
             else:
@@ -252,15 +286,12 @@ def calculate_signals(raw_symbol: str):
                     signal_time_utc = latest_time.astimezone(timezone.utc).replace(tzinfo=None)
                 signal_time_ist = (signal_time_utc + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
 
-            # Duplicate prevention
             now = datetime.now()
-            if key in last_signal_sent:
-                if (now - last_signal_sent[key]).total_seconds() < 25 * 60:
-                    log.debug("Duplicate signal skipped for %s", display)
-                    return
+            if key in last_signal_sent and (now - last_signal_sent[key]).total_seconds() < 25 * 60:
+                log.debug("Duplicate signal skipped for %s", display)
+                return
             last_signal_sent[key] = now
 
-            # Send message
             if is_buy:
                 tp = close_now + atr_now * 3.0
                 sl = close_now - atr_now * 1.5
@@ -295,7 +326,7 @@ def calculate_signals(raw_symbol: str):
 # Main scan loop
 # -----------------------------
 def scan_loop():
-    log.info("Continuous scanner started (%.1fs/symbol, %.1fs/round, last %d bars).",
+    log.info("Scanner started (%.1fs/symbol, %.1fs/round, last %d bars).",
              PAUSE_BETWEEN_SYMBOLS, SLEEP_BETWEEN_SCANS, N_BARS)
     while True:
         start_time = datetime.now()
