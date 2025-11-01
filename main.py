@@ -9,7 +9,8 @@ import requests
 # === CONFIG ===
 INTERVAL = Interval.in_30_minute  # 30m timeframe
 LOOKBACK = 96  # last 96 candles
-SLEEP_TIME = 180  # 3 minutes between scans
+SLEEP_TIME = 180  # 3 minutes between full scans
+PER_SYMBOL_DELAY = 3  # 3 seconds between symbols
 
 # === LOGGER SETUP ===
 logging.basicConfig(
@@ -24,6 +25,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message: str):
     """Send formatted message to Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ Telegram credentials missing.")
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -38,7 +42,7 @@ def send_telegram_message(message: str):
 # === LOAD SYMBOLS ===
 try:
     symbols_df = pd.read_csv("ALL_WATCHLIST_SYMBOLS.csv")
-    symbols = symbols_df["SYMBOL"].tolist()
+    symbols = symbols_df["SYMBOL"].dropna().tolist()
     log.info(f"✅ Loaded {len(symbols)} symbols from CSV")
 except Exception as e:
     log.error(f"❌ Error loading CSV: {e}")
@@ -47,39 +51,45 @@ except Exception as e:
 # === TVDATAFEED LOGIN ===
 try:
     tv = TvDatafeed()
+    log.info("✅ tvDatafeed initialized (nologin mode).")
 except Exception as e:
-    log.warning(f"⚠️ Cookie login failed, using nologin fallback: {e}")
-    tv = TvDatafeed()
+    log.error(f"⚠️ tvDatafeed initialization failed: {e}")
+    tv = None
 
-# === CORE SIGNAL SCAN FUNCTION ===
-def run_scan():
-    for symbol_exchange in symbols:
-        try:
-            # Example symbol format: NSE:SBIN or NASDAQ:AAPL
-            exchange, symbol_clean = symbol_exchange.split(":")
-            data = tv.get_hist(symbol_clean, exchange, interval=INTERVAL, n=LOOKBACK)
-            if data is None or data.empty:
-                continue
+# === MAIN SCAN FUNCTION ===
+def scan_symbol(symbol_exchange):
+    """Scan individual symbol for signals."""
+    try:
+        if ":" not in symbol_exchange:
+            return
+        exchange, symbol_clean = symbol_exchange.split(":")
 
-            # --- Calculate signals (replace with your PineScript logic) ---
-            close = data["close"]
-            high = data["high"]
-            low = data["low"]
+        df = tv.get_hist(
+            symbol=symbol_clean,
+            exchange=exchange,
+            interval=INTERVAL,
+            n_bars=LOOKBACK
+        )
 
-            # Example custom strategy logic:
-            atr = (high - low).rolling(window=14).mean().iloc[-1]
-            latest_close = close.iloc[-1]
-            prev_close = close.iloc[-2]
+        if df is None or df.empty:
+            log.warning(f"⚠️ No data for {exchange}:{symbol_clean}")
+            return
 
-            # Define dummy buy/sell signal conditions
-            if latest_close > prev_close * 1.002:  # +0.2% move up
-                latest_type = "BUY"
-            elif latest_close < prev_close * 0.998:  # -0.2% move down
-                latest_type = "SELL"
-            else:
-                continue
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
 
-            # ---- Send Telegram message ----
+        atr = (high - low).rolling(window=14).mean().iloc[-1]
+        latest_close = close.iloc[-1]
+        prev_close = close.iloc[-2]
+
+        latest_type = None
+        if latest_close > prev_close * 1.002:
+            latest_type = "BUY"
+        elif latest_close < prev_close * 0.998:
+            latest_type = "SELL"
+
+        if latest_type:
             tp, sl = (latest_close + atr * 3.0, latest_close - atr * 1.5) if latest_type == "BUY" else (
                 latest_close - atr * 3.0, latest_close + atr * 1.5)
 
@@ -95,20 +105,30 @@ def run_scan():
 
             log.info(f"{latest_type} → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
+        else:
+            log.info(f"➡️ No new signal for {exchange}:{symbol_clean}")
 
-        except Exception as e:
-            log.error(f"Error scanning {symbol_exchange}: {e}")
+    except Exception as e:
+        log.error(f"❌ Error scanning {symbol_exchange}: {e}")
 
-# === MAIN LOOP ===
-if __name__ == "__main__":
-    log.info(f"🚀 Scanner started (3-min continuous mode, last {LOOKBACK} candles).")
-
+# === LOOP FUNCTION ===
+def scan_loop():
+    log.info("🚀 Scanner started (3-min continuous mode, 3s per symbol, last 96 candles).")
     while True:
-        try:
-            start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            log.info(f"🕒 Running scan at {start_time}")
-            run_scan()
-            log.info("✅ Scan complete. Sleeping 3 minutes...\n")
-        except Exception as e:
-            log.error(f"❌ Fatal scan error: {e}")
+        start_time = datetime.now()
+        log.info(f"🕒 Starting scan at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        for i, sym in enumerate(symbols, 1):
+            scan_symbol(sym)
+            log.info(f"⏳ Sleeping {PER_SYMBOL_DELAY}s... ({i}/{len(symbols)})")
+            time.sleep(PER_SYMBOL_DELAY)
+
+        log.info(f"✅ Full scan complete. Sleeping {SLEEP_TIME//60} minutes before next round...\n")
         time.sleep(SLEEP_TIME)
+
+# === MAIN ENTRY ===
+if __name__ == "__main__":
+    if tv:
+        scan_loop()
+    else:
+        log.error("🚫 tvDatafeed not initialized. Exiting...")
