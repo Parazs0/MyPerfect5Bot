@@ -265,70 +265,83 @@ def try_get_hist(tvc, symbol, exchange, interval, n_bars):
 # -----------------------------
 # Signal calc (Pine-alike)
 # -----------------------------
-def calculate_signals(raw_symbol: str):
+def calculate_signals(symbol: str):
     global tv
     try:
-        ex_token, sym_token = parse_symbol(raw_symbol)
-        ex_token = (ex_token or "NSE")
-        sym_token = str(sym_token).strip()
-        if not sym_token:
-            return
-
-        try:
-            df, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
-        except Exception as e:
-            log.warning("Failed fetching bars for %s (tried %s): %s", raw_symbol, ex_token, e)
-            return
-
+        exchange, symbol_clean = parse_symbol(symbol)
+        df = tv.get_hist(symbol=symbol_clean, exchange=exchange, interval=Interval.in_30_minute, n_bars=96)
         if df is None or df.empty:
-            log.debug("No data for %s", raw_symbol)
             return
-
         df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
-        for c in ["close","high","low"]:
+        for c in ["close", "high", "low"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(inplace=True)
-        if len(df) < 60:
-            log.debug("Insufficient bars for %s (len=%d)", raw_symbol, len(df))
+        if len(df) < 50:
             return
 
-        ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
-        ema50 = EMAIndicator(df["close"], window=50).ema_indicator()
-        ema20_now, ema20_prev = float(ema20.iat[-1]), float(ema20.iat[-2])
-        # supertrend (period=10, factor=3)
-        super_series, _ = compute_supertrend(df, period=10, multiplier=3.0)
-        super_now, super_prev = float(super_series.iat[-1]), float(super_series.iat[-2])
-        atr_series = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
-        atr_now = float(atr_series.iat[-1])
-        close_now = float(df["close"].iat[-1])
-        close_prev = float(df["close"].iat[-2])
+        ema20 = EMAIndicator(df["close"], 20).ema_indicator()
+        supertrend, _ = compute_supertrend(df)
+        atr = AverageTrueRange(df['high'], df['low'], df['close'], 14).average_true_range()
 
-        buy = (close_now > ema20_now) and (close_now > super_now) and not ((close_prev > ema20_prev) and (close_prev > super_prev))
-        sell = (close_now < ema20_now) and (close_now < super_now) and not ((close_prev < ema20_prev) and (close_prev < super_prev))
+        # ---- Signal calculation across all candles ----
+        buy_cond = (df["close"] > ema20) & (df["close"] > supertrend)
+        sell_cond = (df["close"] < ema20) & (df["close"] < supertrend)
 
-        display = f"{used_ex or ex_token}:{sym_token}"
-        if buy:
-            tp = close_now + atr_now * 3.0
-            sl = close_now - atr_now * 1.5
-            msg = (f"**PERFECT 5 SIGNAL - BUY**\nSymbol: `{display}`\nPrice: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info("BUY → %s", display)
+        # crossover logic like Pine Script: detect transitions
+        buy_signals = buy_cond & ~(buy_cond.shift(1).fillna(False))
+        sell_signals = sell_cond & ~(sell_cond.shift(1).fillna(False))
+
+        last_buy_idx = buy_signals[buy_signals].index[-1] if buy_signals.any() else None
+        last_sell_idx = sell_signals[sell_signals].index[-1] if sell_signals.any() else None
+
+        # latest signal among both
+        if last_buy_idx is None and last_sell_idx is None:
+            return
+
+        latest_type = None
+        latest_idx = None
+        if last_buy_idx is not None and (last_sell_idx is None or last_buy_idx > last_sell_idx):
+            latest_type = "BUY"
+            latest_idx = last_buy_idx
+        elif last_sell_idx is not None:
+            latest_type = "SELL"
+            latest_idx = last_sell_idx
+
+        if latest_idx is None:
+            return
+
+        close_now = df.loc[latest_idx, "close"]
+        atr_now = atr.loc[latest_idx]
+
+        # Avoid duplicate signals (within same candle already sent)
+        signal_id = f"{symbol_clean}_{exchange}_{df.loc[latest_idx, 'datetime']}_{latest_type}"
+        if hasattr(calculate_signals, "sent_signals") and signal_id in calculate_signals.sent_signals:
+            return
+        calculate_signals.sent_signals = getattr(calculate_signals, "sent_signals", set())
+        calculate_signals.sent_signals.add(signal_id)
+
+        # ---- Send Telegram message ----
+        if latest_type == "BUY":
+            tp, sl = close_now + atr_now * 2, close_now - atr_now
+            msg = (f"**PERFECT 5 SIGNAL - BUY**\n"
+                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
+                   f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
+            log.info(f"BUY → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
-        if sell:
-            tp = close_now - atr_now * 3.0
-            sl = close_now + atr_now * 1.5
-            msg = (f"**PERFECT 5 SIGNAL - SELL**\nSymbol: `{display}`\nPrice: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info("SELL → %s", display)
+
+        elif latest_type == "SELL":
+            tp, sl = close_now - atr_now * 2, close_now + atr_now
+            msg = (f"**PERFECT 5 SIGNAL - SELL**\n"
+                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
+                   f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
+            log.info(f"SELL → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
 
     except Exception as e:
-        log.exception("Error processing %s: %s", raw_symbol, e)
-        s = str(e).lower()
-        if "session" in s or "expired" in s or "401" in s:
-            log.info("Session problem detected — reloading tv session.")
-            try:
-                tv = load_tv_session()
-            except Exception:
-                log.exception("Reload failed")
+        log.warning(f"⚠️ Error in {symbol}: {e}")
+        if "session" in str(e).lower() or "expired" in str(e).lower():
+            log.info("🔄 Reloading TradingView session...")
+            tv = load_tv_session()
 
 # -----------------------------
 # 30-minute UTC synchronization
