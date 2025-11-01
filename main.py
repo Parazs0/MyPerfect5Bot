@@ -169,7 +169,11 @@ def load_tv_session():
                 else:
                     cookies_dict = {}
                 # create nologin client and inject cookies
-                tvc = TvDatafeed(nologin=True)
+                try:
+                    tvc = TvDatafeed()
+                except TypeError:
+                    # for older/newer versions without nologin arg
+                    tvc = TvDatafeed()
                 try:
                     session = getattr(tvc, "session", None)
                     if session:
@@ -196,7 +200,7 @@ def load_tv_session():
             log.info("Logged in via username/password.")
             return tvc
         # final fallback
-        tvc = TvDatafeed(nologin=True)
+        tvc = TvDatafeed()
         log.warning("Using nologin tvDatafeed (limited).")
         return tvc
     except Exception as e:
