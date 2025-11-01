@@ -1,4 +1,4 @@
-# main.py (Final Fixed Version)
+# main.py (Final Fixed Version) - fixed with parse_symbol
 import os, base64, json, tempfile, logging, threading, time
 from datetime import datetime
 from flask import Flask
@@ -74,8 +74,9 @@ log.info(f"✅ Loaded {len(symbols)} symbols from CSV")
 # Exchange detection helper
 # -----------------------------
 def detect_exchange(symbol: str) -> str:
+    # check csv EXCHANGE column first (case-insensitive match)
     if "EXCHANGE" in symbols_df.columns:
-        row = symbols_df.loc[symbols_df["SYMBOL"] == symbol]
+        row = symbols_df.loc[symbols_df["SYMBOL"].astype(str).str.upper() == symbol.upper()]
         if not row.empty:
             val = str(row["EXCHANGE"].iat[0]).strip().upper()
             if val:
@@ -86,9 +87,53 @@ def detect_exchange(symbol: str) -> str:
     for ex in known:
         if ex in s:
             return ex
-    if s.endswith(".NS"): return "NSE"
-    if s.endswith(".BO"): return "BSE"
+    if s.endswith(".NS") or s.endswith(":NSE") or s.endswith("-NS"):
+        return "NSE"
+    if s.endswith(".BO") or s.endswith(":BSE") or s.endswith("-BO"):
+        return "BSE"
+    # fallback
     return "NSE"
+
+# -----------------------------
+# Helper to safely parse symbol/exchange
+# -----------------------------
+def parse_symbol(raw_symbol: str):
+    """
+    Return tuple (exchange, symbol_clean)
+    Examples:
+      "NSE:RELIANCE" -> ("NSE", "RELIANCE")
+      "BSE:SENSEX"   -> ("BSE", "SENSEX")
+      "RELIANCE.NS"  -> ("NSE", "RELIANCE")
+      "GOLD1!"       -> ("MCX" or detected), "GOLD1!"
+    """
+    s = str(raw_symbol).strip()
+    if not s:
+        return ("NSE", s)
+
+    # If explicit prefix like EXCHANGE:SYMBOL
+    if ":" in s:
+        parts = s.split(":")
+        ex = parts[0].strip().upper()
+        sym = ":".join(parts[1:]).strip()  # join if extra colons
+        # clean symbol (remove accidental spaces)
+        return (ex, sym)
+
+    # handle suffix style like SYMBOL.NS or SYMBOL.BO
+    if s.upper().endswith(".NS"):
+        return ("NSE", s[:-3])
+    if s.upper().endswith(".BO"):
+        return ("BSE", s[:-3])
+
+    # sometimes tradingview uses -XX or .XX; handle some common cases
+    if s.endswith("-NS") or s.endswith("-BO"):
+        if s.endswith("-NS"):
+            return ("NSE", s[:-3])
+        if s.endswith("-BO"):
+            return ("BSE", s[:-3])
+
+    # else fallback to detect_exchange
+    ex = detect_exchange(s)
+    return (ex, s)
 
 # -----------------------------
 # Supertrend
@@ -169,15 +214,22 @@ tv = load_tv_session()
 def calculate_signals(symbol: str):
     global tv
     try:
+        original_symbol = symbol
         exchange, symbol_clean = parse_symbol(symbol)
+        # defensive strip
+        exchange = str(exchange).strip().upper()
+        symbol_clean = str(symbol_clean).strip()
+
         df = tv.get_hist(symbol=symbol_clean, exchange=exchange, interval=Interval.in_30_minute, n_bars=200)
         if df is None or df.empty:
+            log.debug(f"No data for {original_symbol} ({exchange}:{symbol_clean})")
             return
         df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
         for c in ["close", "high", "low"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(inplace=True)
         if len(df) < 50:
+            log.debug(f"Insufficient bars for {original_symbol} ({exchange}:{symbol_clean})")
             return
 
         ema20 = EMAIndicator(df["close"], 20).ema_indicator()
@@ -190,20 +242,22 @@ def calculate_signals(symbol: str):
         buy = (close_now > ema_now) and (close_now > super_now) and not ((close_prev > ema_prev) and (close_prev > super_prev))
         sell = (close_now < ema_now) and (close_now < super_now) and not ((close_prev < ema_prev) and (close_prev < super_prev))
 
+        display_symbol = f"{exchange}:{symbol_clean}"
+
         if buy:
             tp, sl = close_now + atr * 2, close_now - atr
             msg = (f"**PERFECT 5 SIGNAL - BUY**\n"
-                   f"Symbol: `{symbol}`\nExchange: `{exchange}`\n"
+                   f"Symbol: `{display_symbol}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info(f"BUY → {exchange}:{symbol}")
+            log.info(f"BUY → {display_symbol}")
             send_telegram_message(msg)
 
         elif sell:
             tp, sl = close_now - atr * 2, close_now + atr
             msg = (f"**PERFECT 5 SIGNAL - SELL**\n"
-                   f"Symbol: `{symbol}`\nExchange: `{exchange}`\n"
+                   f"Symbol: `{display_symbol}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info(f"SELL → {exchange}:{symbol}")
+            log.info(f"SELL → {display_symbol}")
             send_telegram_message(msg)
 
     except Exception as e:
@@ -221,7 +275,10 @@ def scan_loop():
         start = datetime.now()
         log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')}")
         for sym in symbols:
-            calculate_signals(sym)
+            try:
+                calculate_signals(sym)
+            except Exception as e:
+                log.exception(f"Exception while processing {sym}: {e}")
             time.sleep(2)
         log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting {SCAN_INTERVAL_SECONDS}s...")
         time.sleep(SCAN_INTERVAL_SECONDS)
@@ -283,4 +340,3 @@ if __name__ == "__main__":
 
     # Start Flask server (main thread)
     start_flask()
-
