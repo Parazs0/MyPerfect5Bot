@@ -202,7 +202,14 @@ def calculate_signals(raw_symbol: str):
             df = df.loc[:, ~df.columns.duplicated()].copy()
 
         df.dropna(subset=['datetime','close','high','low'], inplace=True)
-        df = df.sort_values('datetime').reset_index(drop=True)
+        
+        # 🩹 Fix ambiguous 'datetime' (if both index and column)
+        if 'datetime' in df.index.names:
+            df = df.reset_index()  # remove datetime from index
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]  # drop duplicate cols
+
+        df = df.sort_values(by='datetime').reset_index(drop=True)
         if len(df) < 10:
             return
 
