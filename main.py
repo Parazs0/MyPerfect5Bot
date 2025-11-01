@@ -92,7 +92,8 @@ def scan_symbol(symbol_exchange):
         if latest_type:
             tp, sl = (latest_close + atr * 3.0, latest_close - atr * 1.5) if latest_type == "BUY" else (
                 latest_close - atr * 3.0, latest_close + atr * 1.5)
-
+            
+            from datetime import datetime, timedelta, timezone
             ist_time = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
 
             msg = (f"**PERFECT 5 SIGNAL - {latest_type}**\n"
