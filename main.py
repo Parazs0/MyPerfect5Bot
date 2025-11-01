@@ -1,192 +1,227 @@
-# =========================================================
-# PERFECT5 SIGNAL BOT (24x7 Cookie + Multi-Exchange Version)
-# =========================================================
-import sys
-sys.path.append('./tvDatafeed')
+# main.py
 import os
+import base64
+import json
+import tempfile
+import logging
+import threading
 import time
-import pandas as pd
 from datetime import datetime
-from dotenv import load_dotenv
+
+from flask import Flask
+import pandas as pd
+
+# ta / tvdatafeed imports
 from tvDatafeed import TvDatafeed, Interval
 from ta.trend import EMAIndicator
-import requests
-import threading
-import http.server
-import socketserver
-import shutil
-import json
+from ta.volatility import AverageTrueRange
 
-# ===========================
-# ENVIRONMENT SETUP
-# ===========================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# -------------------------
+# Logging
+# -------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("perfect5")
+
+# -------------------------
+# Env / Paths
+# -------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 TV_USERNAME = os.getenv("TV_USERNAME")
 TV_PASSWORD = os.getenv("TV_PASSWORD")
+TV_COOKIES_BASE64 = os.getenv("TV_COOKIES_BASE64")
+CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
+PORT = int(os.getenv("PORT", 8000))
 
-COOKIES_PATH = r"C:\Users\Gandhi\Downloads\tradingview-telegram-bot\tradingview_cookies.json"
-
-# ===========================
-# TradingView Login (via cookies or fallback)
-# ===========================
-import base64
-
-COOKIES_PATH = "tradingview_cookies.json"
-
-try:
-    b64 = os.getenv("TV_COOKIES_BASE64")
-    if b64:
-        # Decode Base64 → JSON
-        decoded = base64.b64decode(b64).decode("utf-8")
-        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-            f.write(decoded)
-        print("✅ TradingView cookies loaded from environment variable.")
-
-        # Login using cookies
-        tv = TvDatafeed(
-            username=None,
-            password=None,
-            chromedriver_path=None,
-            auto_login=False,
-            tradingview_cookie_file=COOKIES_PATH
-        )
-        print("✅ TradingView login successful (via cookies).")
-
-    else:
-        print("⚠️ No cookies found in environment. Trying username/password...")
-        if not (TV_USERNAME and TV_PASSWORD):
-            raise Exception("TV_USERNAME or TV_PASSWORD missing.")
-        tv = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
-        print("✅ TradingView login successful (via username/password).")
-
-except Exception as e:
-    print(f"⚠️ TradingView login error: {e}")
-    try:
-        tv = TvDatafeed(nologin=True)
-        print("⚠️ Proceeding with nologin mode (limited access).")
-    except Exception as ex:
-        print(f"❌ Unable to initialize tvDatafeed client: {ex}")
-        raise
-
-# ===========================
-# LOAD CSV SYMBOLS
-# ===========================
-CSV_PATH = r"ALL_WATCHLIST_SYMBOLS.csv"
-if not os.path.exists(CSV_PATH):
-    raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
-
-symbols_df = pd.read_csv(CSV_PATH)
-if "SYMBOL" not in symbols_df.columns:
-    raise KeyError("CSV must contain a 'SYMBOL' column")
-
-symbols = symbols_df["SYMBOL"].dropna().astype(str).unique().tolist()
-print(f"📊 Loaded {len(symbols)} symbols from CSV")
-
-# ===========================
-# TELEGRAM MESSAGE FUNCTION
-# ===========================
+# -------------------------
+# Helper: Telegram send
+# -------------------------
+import requests
 def send_telegram_message(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ Telegram config missing — cannot send message")
+        log.warning("Telegram credentials missing, skipping send.")
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         resp = requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
         if resp.status_code != 200:
-            print(f"Telegram API returned {resp.status_code}: {resp.text}")
+            log.error(f"Telegram API error {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        log.exception("Telegram send error")
 
-# ===========================
-# EXCHANGE DETECTION (UPDATED)
-# ===========================
+# -------------------------
+# Decode cookies (if provided) -> write temp file
+# -------------------------
+cookies_path = None
+if TV_COOKIES_BASE64:
+    try:
+        decoded = base64.b64decode(TV_COOKIES_BASE64)
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tf.write(decoded)
+        tf.close()
+        cookies_path = tf.name
+        log.info(f"Decoded cookies saved to {cookies_path}")
+    except Exception as e:
+        log.exception("Failed to decode TV_COOKIES_BASE64")
+
+# -------------------------
+# Load CSV symbols
+# -------------------------
+if not os.path.exists(CSV_PATH):
+    log.error(f"CSV not found at {CSV_PATH}. Exiting.")
+    raise SystemExit(1)
+
+symbols_df = pd.read_csv(CSV_PATH)
+if "SYMBOL" not in symbols_df.columns:
+    log.error("CSV must contain a SYMBOL column. Exiting.")
+    raise SystemExit(1)
+
+symbols = symbols_df["SYMBOL"].dropna().astype(str).unique().tolist()
+log.info(f"Loaded {len(symbols)} symbols from CSV")
+
+# -------------------------
+# Exchange detection
+# -------------------------
 def detect_exchange(symbol: str) -> str:
-    """Detect exchange name based on CSV or symbol pattern."""
+    # Priority: CSV EXCHANGE column
     if "EXCHANGE" in symbols_df.columns:
-        try:
-            row = symbols_df.loc[symbols_df["SYMBOL"] == symbol]
-            if not row.empty:
-                val = row["EXCHANGE"].iat[0]
-                if isinstance(val, str) and val.strip():
-                    return val.strip().upper()
-        except Exception:
-            pass
+        row = symbols_df.loc[symbols_df["SYMBOL"] == symbol]
+        if not row.empty:
+            val = row["EXCHANGE"].iat[0]
+            if isinstance(val, str) and val.strip():
+                return val.strip().upper()
 
     s = symbol.upper()
-
     if s.endswith(".NS") or s.endswith(":NSE") or s.endswith("-NS"):
         return "NSE"
     if s.endswith(".BO") or s.endswith(":BSE") or s.endswith("-BO"):
         return "BSE"
-
-    if any(x in s for x in ["CRUDE","OIL","BRENT","WTI"]):
+    if any(x in s for x in ["CRUDE","OIL","BRENT","WTI","GOLD","SILVER","XAU","XAG"]):
         return "MCX"
-    if any(x in s for x in ["GOLD","SILVER","XAU","XAG"]):
-        return "MCX"
-    if any(x in s for x in ["BTC","ETH","BNB","COIN","INDEX","NIFTY","SENSEX"]):
+    if any(x in s for x in ["BTC","ETH","BNB","COIN","CRYPTO"]):
         return "INDEX"
     if any(x in s for x in ["USD","EUR","GBP","JPY","FOREX","OANDA"]):
         return "OANDA"
-
-    # Check known exchange codes inside symbol
     known = {"BSE","INDEX","CAPITALCOM","TVC","IG","MCX","OANDA","NSE",
              "NSEIX","SKILLING","SPREADEX","SZSE","VANTAGE"}
     for ex in known:
         if ex in s:
             return ex
-
     return "NSE"
 
-# ===========================
-# SUPERTREND CALCULATION
-# ===========================
-def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
-    from ta.volatility import AverageTrueRange
+# -------------------------
+# Compute Supertrend
+# -------------------------
+def compute_supertrend(df, period=10, multiplier=3.0):
     atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=period).average_true_range()
     hl2 = (df['high'] + df['low']) / 2.0
     upperband = hl2 + (multiplier * atr)
     lowerband = hl2 - (multiplier * atr)
-    final_upper, final_lower = upperband.copy(), lowerband.copy()
+    final_upper = upperband.copy()
+    final_lower = lowerband.copy()
     supertrend = pd.Series(index=df.index, dtype='float64')
     direction = pd.Series(index=df.index, dtype='int64')
-
     for i in range(len(df)):
         if i == 0:
-            final_upper.iat[i], final_lower.iat[i] = upperband.iat[i], lowerband.iat[i]
-            supertrend.iat[i], direction.iat[i] = final_upper.iat[i], 1
+            final_upper.iat[i] = upperband.iat[i]
+            final_lower.iat[i] = lowerband.iat[i]
+            supertrend.iat[i] = final_upper.iat[i]
+            direction.iat[i] = 1
             continue
-        fu_prev, fl_prev = final_upper.iat[i-1], final_lower.iat[i-1]
+        fu_prev = final_upper.iat[i-1]
+        fl_prev = final_lower.iat[i-1]
         close_prev = df['close'].iat[i-1]
         fu = upperband.iat[i] if (upperband.iat[i] < fu_prev or close_prev > fu_prev) else fu_prev
         fl = lowerband.iat[i] if (lowerband.iat[i] > fl_prev or close_prev < fl_prev) else fl_prev
-        final_upper.iat[i], final_lower.iat[i] = fu, fl
+        final_upper.iat[i] = fu
+        final_lower.iat[i] = fl
         if df['close'].iat[i] > fu_prev:
-            direction.iat[i], supertrend.iat[i] = 1, fl
+            direction.iat[i] = 1
+            supertrend.iat[i] = fl
         elif df['close'].iat[i] < fl_prev:
-            direction.iat[i], supertrend.iat[i] = -1, fu
+            direction.iat[i] = -1
+            supertrend.iat[i] = fu
         else:
-            direction.iat[i], supertrend.iat[i] = direction.iat[i-1], supertrend.iat[i-1]
+            direction.iat[i] = direction.iat[i-1]
+            supertrend.iat[i] = supertrend.iat[i-1]
     return supertrend, direction
 
-# ===========================
-# SIGNAL LOGIC
-# ===========================
+# -------------------------
+# tvDatafeed session loader (cookies -> username/password -> nologin)
+# -------------------------
+def load_tv_session():
+    # attempt cookies injection
+    try:
+        if cookies_path:
+            try:
+                with open(cookies_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # convert to dict name->value if list format
+                if isinstance(data, list):
+                    cookies_dict = {c['name']: c['value'] for c in data if 'name' in c and 'value' in c}
+                elif isinstance(data, dict):
+                    # maybe already dict name->value or full cookie
+                    # if values are dicts convert to name->value
+                    if all(isinstance(v, dict) for v in data.values()):
+                        cookies_dict = {k: v.get('value','') for k,v in data.items()}
+                    else:
+                        cookies_dict = data
+                else:
+                    cookies_dict = {}
+                # create nologin client and inject cookies
+                tvc = TvDatafeed(nologin=True)
+                try:
+                    session = getattr(tvc, "session", None)
+                    if session:
+                        for k,v in cookies_dict.items():
+                            session.cookies.set(k, v)
+                    log.info("Injected cookies into tvDatafeed session.")
+                except Exception as e:
+                    log.warning("Could not inject cookies into session: %s", e)
+                # quick test
+                try:
+                    test = tvc.get_hist(symbol="RELIANCE", exchange="NSE", interval=Interval.in_daily, n_bars=1)
+                    if test is not None:
+                        log.info("Cookies-based session working.")
+                        return tvc
+                    else:
+                        log.warning("Cookies-based session didn't return data.")
+                except Exception as e:
+                    log.warning("Cookies session test failed: %s", e)
+            except Exception as e:
+                log.exception("Failed to load cookies file")
+        # fallback to username/password
+        if TV_USERNAME and TV_PASSWORD:
+            tvc = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
+            log.info("Logged in via username/password.")
+            return tvc
+        # final fallback
+        tvc = TvDatafeed(nologin=True)
+        log.warning("Using nologin tvDatafeed (limited).")
+        return tvc
+    except Exception as e:
+        log.exception("Failed to initialize tvDatafeed")
+        return TvDatafeed(nologin=True)
+
+tv = load_tv_session()
+
+# -------------------------
+# Signal calculation per symbol
+# -------------------------
 def calculate_signals(symbol: str):
     global tv
     try:
         exchange = detect_exchange(symbol)
         df = tv.get_hist(symbol=symbol, exchange=exchange, interval=Interval.in_30_minute, n_bars=200)
         if df is None or df.empty:
-            print(f"No data for {symbol} ({exchange})")
+            log.debug(f"No data for {symbol} ({exchange})")
             return
         df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
         for col in ["close","high","low"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df.dropna(inplace=True)
         if len(df) < 50:
-            print(f"Insufficient bars for {symbol}")
+            log.debug(f"Insufficient bars for {symbol}")
             return
 
         ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
@@ -199,7 +234,6 @@ def calculate_signals(symbol: str):
         buy = (close_now > ema_now) and (close_now > super_now) and not ((close_prev > ema_prev) and (close_prev > super_prev))
         sell = (close_now < ema_now) and (close_now < super_now) and not ((close_prev < ema_prev) and (close_prev < super_prev))
 
-        from ta.volatility import AverageTrueRange
         atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range().iat[-1]
 
         if buy:
@@ -207,7 +241,7 @@ def calculate_signals(symbol: str):
             msg = (f"**PERFECT 5 SIGNAL - BUY**\n"
                    f"**Symbol:** `{symbol}`\n**Exchange:** `{exchange}`\n"
                    f"**Price:** `{close_now:.2f}`\n**TP:** `{tp:.2f}`\n**SL:** `{sl:.2f}`\n**TF:** `30m`")
-            print(f"BUY → {symbol}")
+            log.info(f"BUY → {symbol}")
             send_telegram_message(msg)
 
         if sell:
@@ -215,47 +249,54 @@ def calculate_signals(symbol: str):
             msg = (f"**PERFECT 5 SIGNAL - SELL**\n"
                    f"**Symbol:** `{symbol}`\n**Exchange:** `{exchange}`\n"
                    f"**Price:** `{close_now:.2f}`\n**TP:** `{tp:.2f}`\n**SL:** `{sl:.2f}`\n**TF:** `30m`")
-            print(f"SELL → {symbol}")
+            log.info(f"SELL → {symbol}")
             send_telegram_message(msg)
 
     except Exception as e:
-        if "Session expired" in str(e) or "401" in str(e):
-            print("⚠️ Session expired, reloading cookies...")
+        s = str(e).lower()
+        log.exception(f"Error processing {symbol}: {e}")
+        if "session" in s or "401" in s or "expired" in s:
+            log.warning("Session problem detected — reloading tv session.")
             tv = load_tv_session()
-        else:
-            print(f"Error processing {symbol}: {e}")
 
-# ===========================
-# MAIN LOOP
-# ===========================
-def main_loop():
-    print(f"\n🕒 Starting scan at {datetime.now().strftime('%H:%M:%S')}")
-    for sym in symbols:
-        calculate_signals(sym)
-        time.sleep(0.5)
-    print(f"✅ Scan finished at {datetime.now().strftime('%H:%M:%S')}\n")
-
-# ===========================
-# KEEP-ALIVE SERVER (Render)
-# ===========================
-PORT = 8000
-class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-def run_server():
-    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
-        print(f"🌐 Health-check server running on port {PORT}")
-        httpd.serve_forever()
-
-# ===========================
-# RUN BOT FOREVER
-# ===========================
-if __name__ == "__main__":
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
+# -------------------------
+# Scanning loop (background)
+# -------------------------
+SCAN_INTERVAL_SECONDS = 120  # full-scan interval
+def scan_loop():
+    log.info("Starting scan loop.")
     while True:
-        main_loop()
-        time.sleep(120)
+        start = datetime.now()
+        log.info(f"--- Scan started at {start.strftime('%Y-%m-%d %H:%M:%S')} ---")
+        for symbol in symbols:
+            try:
+                calculate_signals(symbol)
+            except Exception as e:
+                log.exception(f"Exception during symbol {symbol}: {e}")
+            time.sleep(0.4)  # gentle
+        end = datetime.now()
+        log.info(f"--- Scan finished at {end.strftime('%Y-%m-%d %H:%M:%S')} (duration {(end-start).total_seconds():.1f}s) ---")
+        time.sleep(SCAN_INTERVAL_SECONDS)
+
+# -------------------------
+# Flask health server
+# -------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "MyPerfect5Bot running"
+
+@app.route("/health")
+def health():
+    return "OK"
+
+# -------------------------
+# Start background thread + Flask
+# -------------------------
+if __name__ == "__main__":
+    # start scanner in background
+    t = threading.Thread(target=scan_loop, daemon=True)
+    t.start()
+    log.info("Scanner thread started, launching Flask server.")
+    app.run(host="0.0.0.0", port=PORT)
