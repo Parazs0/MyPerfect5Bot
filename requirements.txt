@@ -5,3 +5,4 @@ flask
 ta
 python-dotenv
 websocket-client
+tvDatafeed==2.1.0

@@ -88,14 +88,20 @@ def init_tv():
     if username and password:
         try:
             tv = TvDatafeed(username=username, password=password)
-            try:
-                cookies_data = pickle.dumps(tv.cookies)
-                b64_data = base64.b64encode(cookies_data).decode('utf-8')
-                with open(COOKIES_B64_FILE, 'w') as f:
-                    f.write(b64_data)
-                log.info("Logged in & cookies saved to cookies.b64.txt")
-            except Exception as save_e:
-                log.warning("Could not save cookies.b64.txt: %s", save_e)
+            log.info("Logged in successfully")
+            
+            # Safe cookies save: Check if cookies attribute exists
+            if hasattr(tv, 'cookies') and tv.cookies:
+                try:
+                    cookies_data = pickle.dumps(tv.cookies)
+                    b64_data = base64.b64encode(cookies_data).decode('utf-8')
+                    with open(COOKIES_B64_FILE, 'w') as f:
+                        f.write(b64_data)
+                    log.info("Logged in & cookies saved to cookies.b64.txt")
+                except Exception as save_e:
+                    log.warning("Could not save cookies.b64.txt: %s", save_e)
+            else:
+                log.warning("Login succeeded but no cookies attribute found")
             return
         except Exception as e:
             log.warning("Login failed: %s", e)
