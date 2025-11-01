@@ -205,13 +205,18 @@ def calculate_signals(raw_symbol: str):
         
         # 🩹 Fix ambiguous 'datetime' (if both index and column)
         if 'datetime' in df.index.names:
-            df = df.reset_index()  # remove datetime from index
-        if df.columns.duplicated().any():
-            df = df.loc[:, ~df.columns.duplicated()]  # drop duplicate cols
+                df = df.reset_index()  # remove datetime from index
+                if 'datetime' in df.columns.duplicated(keep=False):
+                    df = df.loc[:, ~df.columns.duplicated()]  # remove duplicates again
+                elif 'datetime' not in df.columns:
+                    df = df.reset_index()  # in case datetime is only in index
 
-        df = df.sort_values(by='datetime').reset_index(drop=True)
-        if len(df) < 10:
-            return
+                if df.columns.duplicated().any():
+                    df = df.loc[:, ~df.columns.duplicated()]  # safety again
+    
+                df = df.sort_values(by='datetime').reset_index(drop=True)
+                if len(df) < 10:
+                    return
 
         # compute indicators
         ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
