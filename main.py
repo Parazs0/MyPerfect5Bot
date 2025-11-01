@@ -169,8 +169,8 @@ tv = load_tv_session()
 def calculate_signals(symbol: str):
     global tv
     try:
-        exchange = detect_exchange(symbol)
-        df = tv.get_hist(symbol, exchange, Interval.in_30_minute, 200)
+        exchange, symbol_clean = parse_symbol(symbol)
+        df = tv.get_hist(symbol=symbol_clean, exchange=exchange, interval=Interval.in_30_minute, n_bars=200)
         if df is None or df.empty:
             return
         df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
