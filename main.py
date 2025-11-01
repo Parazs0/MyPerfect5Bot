@@ -64,6 +64,21 @@ except Exception as e:
     log.warning(f"⚠️ tvDatafeed init failed: {e}")
     tv = TvDatafeed()
 
+# === SYMBOL PARSER ===
+def parse_symbol(raw: str):
+    s = str(raw).strip()
+    if not s:
+        return ("NSE", "")
+    if ":" in s:
+        ex, sym = s.split(":", 1)
+        return (ex.strip().upper(), sym.strip().upper())
+    up = s.upper()
+    if up.endswith(".NS") or up.endswith("-NS"):
+        return ("NSE", s[:-3])
+    if up.endswith(".BO") or up.endswith("-BO"):
+        return ("BSE", s[:-3])
+    return ("NSE", s)
+
 # -----------------------------
 # Strategy Signal Calculation
 # -----------------------------
