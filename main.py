@@ -338,4 +338,3 @@ def start_flask():
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
     start_flask()
-is script me last ninty six candle ka har signal mil raha hai bot ko par hame last ninty six candle ka last signal chahiye har scan me
