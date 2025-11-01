@@ -192,10 +192,24 @@ def calculate_signals(raw_symbol: str):
             log.debug("No data for %s", raw_symbol)
             return
 
-        # normalize df
-        df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
-        # ensure datetime column is pandas datetime
-        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+        # --- normalize dataframe safely ---
+        if 'datetime' not in df.columns:
+           if isinstance(df.index, pd.DatetimeIndex):
+               df = df.copy()
+               df['datetime'] = df.index
+           else:
+               df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
+        else:
+            # ensure no duplicate column names
+            df = df.loc[:, ~df.columns.duplicated()].copy()
+
+        # ensure datetime conversion is safe
+        if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+            try:
+                df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+            except Exception:
+                log.warning("Datetime conversion issue for %s, forcing UTC-naive", raw_symbol)
+                df['datetime'] = pd.to_datetime(df.index, errors='coerce')
         for c in ["close", "high", "low"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(subset=['datetime','close','high','low'], inplace=True)
