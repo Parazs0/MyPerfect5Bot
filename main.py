@@ -1,5 +1,5 @@
 import os, base64, json, tempfile, logging, threading, time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 import pandas as pd
 import requests
@@ -23,7 +23,6 @@ TV_PASSWORD = os.getenv("TV_PASSWORD")
 TV_COOKIES_BASE64 = os.getenv("TV_COOKIES_BASE64")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-SCAN_INTERVAL_SECONDS = 1800  # scan every 30 minutes
 
 # -----------------------------
 # Telegram sender
@@ -73,31 +72,10 @@ log.info(f"✅ Loaded {len(symbols)} symbols from CSV")
 # Exchange detection helper
 # -----------------------------
 def parse_symbol(symbol: str):
-    """Splits exchange and symbol if present like NSE:RELIANCE"""
     if ":" in symbol:
         ex, sym = symbol.split(":", 1)
         return ex.strip().upper(), sym.strip().upper()
-    ex = detect_exchange(symbol)
-    return ex, symbol.strip().upper()
-
-def detect_exchange(symbol: str) -> str:
-    if "EXCHANGE" in symbols_df.columns:
-        row = symbols_df.loc[symbols_df["SYMBOL"] == symbol]
-        if not row.empty:
-            val = str(row["EXCHANGE"].iat[0]).strip().upper()
-            if val:
-                return val
-    s = symbol.upper()
-    known = {"BSE", "INDEX", "CAPITALCOM", "TVC", "IG", "MCX", "OANDA", "NSE", "NSEIX",
-             "SKILLING", "SPREADEX", "SZSE", "VANTAGE"}
-    for ex in known:
-        if ex in s:
-            return ex
-    if s.endswith(".NS"):
-        return "NSE"
-    if s.endswith(".BO"):
-        return "BSE"
-    return "NSE"
+    return "NSE", symbol.strip().upper()
 
 # -----------------------------
 # Supertrend
@@ -131,31 +109,26 @@ def compute_supertrend(df, period=10, multiplier=3.0):
 # -----------------------------
 def load_tv_session():
     try:
+        import requests
+        tvc = TvDatafeed()
         if cookies_path:
             with open(cookies_path, "r", encoding="utf-8") as f:
                 cookies_data = json.load(f)
-            tvc = TvDatafeed()
-            import requests
             session = requests.Session()
             for c in cookies_data:
                 if isinstance(c, dict) and "name" in c and "value" in c:
                     session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".tradingview.com"))
             tvc.session = session
-            log.info("✅ Cookies successfully injected into tvDatafeed session.")
-            test = tvc.get_hist("RELIANCE", "NSE", Interval.in_daily, 1)
-            if test is not None and not test.empty:
-                log.info("✅ Cookies login verified successfully.")
-                return tvc
-
+            log.info("✅ Cookies injected into tvDatafeed session.")
+        test = tvc.get_hist("RELIANCE", "NSE", Interval.in_daily, 1)
+        if test is not None and not test.empty:
+            log.info("✅ TV connection verified successfully.")
+            return tvc
         if TV_USERNAME and TV_PASSWORD:
             tvc = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
             log.info("✅ TradingView login via username/password successful.")
             return tvc
-
-        tvc = TvDatafeed()
-        log.warning("⚠️ Using nologin mode (limited data).")
         return tvc
-
     except Exception as e:
         log.error(f"Failed to initialize tvDatafeed: {e}")
         return TvDatafeed()
@@ -191,16 +164,14 @@ def calculate_signals(symbol: str):
 
         if buy:
             tp, sl = close_now + atr * 2, close_now - atr
-            msg = (f"**PERFECT 5 SIGNAL - BUY**\n"
-                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
+            msg = (f"**PERFECT 5 SIGNAL - BUY**\nSymbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
             log.info(f"BUY → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
 
         elif sell:
             tp, sl = close_now - atr * 2, close_now + atr
-            msg = (f"**PERFECT 5 SIGNAL - SELL**\n"
-                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
+            msg = (f"**PERFECT 5 SIGNAL - SELL**\nSymbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
             log.info(f"SELL → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
@@ -212,18 +183,32 @@ def calculate_signals(symbol: str):
             tv = load_tv_session()
 
 # -----------------------------
-# Background scanner
+# Candle Sync (align with 30-min candle)
+# -----------------------------
+def wait_until_next_30min():
+    now = datetime.now(timezone.utc)
+    minute = now.minute
+    if minute < 30:
+        next_candle = now.replace(minute=30, second=0, microsecond=0)
+    else:
+        next_candle = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    wait_seconds = (next_candle - now).total_seconds()
+    log.info(f"🕒 Waiting {int(wait_seconds)}s until next 30m candle close ({next_candle.strftime('%H:%M:%S UTC')})")
+    time.sleep(wait_seconds + 5)  # 5s buffer
+
+# -----------------------------
+# Background scanner (synced)
 # -----------------------------
 def scan_loop():
-    log.info("🚀 Scan loop started.")
+    log.info("🚀 Scan loop started (candle synced).")
     while True:
+        wait_until_next_30min()
         start = datetime.now()
-        log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')}")
+        log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')} UTC")
         for sym in symbols:
             calculate_signals(sym)
-            time.sleep(3)
-        log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting {SCAN_INTERVAL_SECONDS}s...")
-        time.sleep(SCAN_INTERVAL_SECONDS)
+            time.sleep(2)
+        log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting for next 30m candle...")
 
 # -----------------------------
 # Flask + Keepalive
@@ -234,7 +219,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "✅ MyPerfect5Bot is live on Render!",
-        "scanner": "running",
+        "scanner": "30-min synced",
         "uptime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
