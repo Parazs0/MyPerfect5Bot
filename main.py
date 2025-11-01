@@ -79,6 +79,36 @@ def parse_symbol(raw: str):
         return ("BSE", s[:-3])
     return ("NSE", s)
 
+# === TRY GET HIST WITH FALLBACK EXCHANGES ===
+def try_get_hist(tvc, symbol, exchange, interval, n_bars):
+    """
+    Try fetching data from multiple exchanges in fallback order
+    until one returns valid bars.
+    """
+    tried = []
+    if exchange:
+        tried.append(exchange)
+    tried.extend([e for e in ["NSE","BSE","MCX","TVC","INDEX","OANDA","SKILLING","CAPITALCOM","VANTAGE","IG","SPREADEX","SZSE"]
+                  if e not in tried])
+    tried.append(None)  # final try without exchange
+
+    last_exc = None
+    for ex in tried:
+        try:
+            if ex:
+                df = tvc.get_hist(symbol=symbol, exchange=ex, interval=interval, n_bars=n_bars)
+            else:
+                df = tvc.get_hist(symbol=symbol, interval=interval, n_bars=n_bars)
+            if df is not None and not df.empty:
+                return df, ex
+        except Exception as e:
+            last_exc = e
+            continue
+
+    if last_exc:
+        raise last_exc
+    return None, None
+
 # -----------------------------
 # Strategy Signal Calculation
 # -----------------------------
