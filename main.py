@@ -17,7 +17,7 @@ except Exception as e:
     tv = TvDatafeed()
 
 # --- Load symbols ---
-symbols_df = pd.read_csv("symbols.csv")
+symbols_df = pd.read_csv("ALL_WATCHLIST_SYMBOLS.csv")
 symbols = symbols_df["SYMBOL"].tolist()
 log.info(f"✅ Loaded {len(symbols)} symbols from CSV")
 
