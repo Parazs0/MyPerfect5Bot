@@ -189,47 +189,39 @@ def calculate_signals(raw_symbol: str):
             return
 
         if df is None or df.empty:
-            log.debug("No data for %s", raw_symbol)
             return
 
-        # --- normalize dataframe safely ---
+        # normalize dataframe
         if 'datetime' not in df.columns:
-           if isinstance(df.index, pd.DatetimeIndex):
-               df = df.copy()
-               df['datetime'] = df.index
-           else:
-               df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.copy()
+                df['datetime'] = df.index
+            else:
+                df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
         else:
-            # ensure no duplicate column names
             df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        # ensure datetime conversion is safe
         if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
-            try:
-                df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
-            except Exception:
-                log.warning("Datetime conversion issue for %s, forcing UTC-naive", raw_symbol)
-                df['datetime'] = pd.to_datetime(df.index, errors='coerce')
+            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+
         for c in ["close", "high", "low"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(subset=['datetime','close','high','low'], inplace=True)
         if len(df) < 10:
-            log.debug("Insufficient bars for %s (len=%d)", raw_symbol, len(df))
             return
 
-        # compute indicators on full returned df (but we'll only scan last N_BARS)
+        # compute indicators
         ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
-        ema50 = EMAIndicator(df["close"], window=50).ema_indicator()
         super_series, _ = compute_supertrend(df, period=10, multiplier=3.0)
         atr_series = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
-
         display = f"{used_ex or ex_token}:{sym_token}"
 
-        # determine start index to limit to last N_BARS (but keep at least 1 so i-1 exists)
         start_idx = max(1, len(df) - N_BARS)
         end_idx = len(df)
 
-        # --- Scan last N_BARS for signals ---
+        # --- Track only last signal ---
+        last_signal = None
+
         for i in range(start_idx, end_idx):
             try:
                 close_now = float(df["close"].iat[i])
@@ -241,56 +233,39 @@ def calculate_signals(raw_symbol: str):
                 atr_now = float(atr_series.iat[i]) if not pd.isna(atr_series.iat[i]) else 0.0
                 signal_time = df["datetime"].iat[i]
 
-                # convert to IST string safely
-                if pd.isna(signal_time):
-                    signal_time_ist = datetime.utcnow().strftime("%d-%b %H:%M")
-                else:
-                    # if Timestamp is timezone-aware, convert to UTC then add IST offset; else treat as UTC-naive
-                    if signal_time.tzinfo is None:
-                        # treat as UTC-naive (this matches many tvDatafeed outputs)
-                        signal_time_utc = signal_time
-                    else:
-                        signal_time_utc = signal_time.astimezone(timezone.utc).replace(tzinfo=None)
-                    signal_time_ist = (signal_time_utc + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
-
-                # skip if indicator values missing
                 if ema20_now is None or ema20_prev is None or super_now is None or super_prev is None:
                     continue
 
                 buy = (close_now > ema20_now) and (close_now > super_now) and not ((close_prev > ema20_prev) and (close_prev > super_prev))
                 sell = (close_now < ema20_now) and (close_now < super_now) and not ((close_prev < ema20_prev) and (close_prev < super_prev))
 
-                if buy:
-                    tp = close_now + atr_now * 3.0
-                    sl = close_now - atr_now * 1.5
-                    msg = (
-                        f"**PERFECT 5 SIGNAL - BUY**\n"
-                        f"Symbol: `{display}`\n"
-                        f"Price: `{close_now:.2f}`\n"
-                        f"TP: `{tp:.2f}`\n"
-                        f"SL: `{sl:.2f}`\n"
-                        f"Time: `{signal_time_ist} IST`"
-                    )
-                    log.info("📈 BUY → %s @ %s", display, signal_time_ist)
-                    send_telegram_message(msg)
-
-                if sell:
-                    tp = close_now - atr_now * 3.0
-                    sl = close_now + atr_now * 1.5
-                    msg = (
-                        f"**PERFECT 5 SIGNAL - SELL**\n"
-                        f"Symbol: `{display}`\n"
-                        f"Price: `{close_now:.2f}`\n"
-                        f"TP: `{tp:.2f}`\n"
-                        f"SL: `{sl:.2f}`\n"
-                        f"Time: `{signal_time_ist} IST`"
-                    )
-                    log.info("📉 SELL → %s @ %s", display, signal_time_ist)
-                    send_telegram_message(msg)
+                if buy or sell:
+                    # Convert time to IST string
+                    signal_time_ist = (
+                        (signal_time.tz_localize(None) if signal_time.tzinfo is None else signal_time.tz_convert(None))
+                        + timedelta(hours=5, minutes=30)
+                    ).strftime("%d-%b %H:%M")
+                    tp = close_now + atr_now * (3.0 if buy else -3.0)
+                    sl = close_now - atr_now * (1.5 if buy else -1.5)
+                    last_signal = ("BUY" if buy else "SELL", signal_time_ist, close_now, tp, sl)
 
             except Exception as inner_e:
                 log.debug("Error evaluating bar %d for %s: %s", i, display, inner_e)
                 continue
+
+        # --- Send only last signal found in last 96 candles ---
+        if last_signal:
+            sig, t, price, tp, sl = last_signal
+            msg = (
+                f"**PERFECT 5 SIGNAL - {sig}**\n"
+                f"Symbol: `{display}`\n"
+                f"Price: `{price:.2f}`\n"
+                f"TP: `{tp:.2f}`\n"
+                f"SL: `{sl:.2f}`\n"
+                f"Time: `{t} IST`"
+            )
+            log.info("📊 %s → %s @ %s", sig, display, t)
+            send_telegram_message(msg)
 
     except Exception as e:
         log.exception("Error processing %s: %s", raw_symbol, e)
