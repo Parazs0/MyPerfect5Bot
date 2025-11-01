@@ -5,4 +5,4 @@ flask
 ta
 python-dotenv
 websocket-client
-tvdatafeed==2.0.0
+git+https://github.com/stefanomorni/fork-tvdatafeed.git
