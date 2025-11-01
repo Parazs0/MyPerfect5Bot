@@ -1,7 +1,6 @@
-# main.py (Final Fixed Version) - fixed with parse_symbol
 import os, base64, json, tempfile, logging, threading, time
 from datetime import datetime
-from flask import Flask
+from flask import Flask, jsonify
 import pandas as pd
 import requests
 from tvDatafeed import TvDatafeed, Interval
@@ -24,7 +23,7 @@ TV_PASSWORD = os.getenv("TV_PASSWORD")
 TV_COOKIES_BASE64 = os.getenv("TV_COOKIES_BASE64")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-SCAN_INTERVAL_SECONDS = 1800  # scan every 30 min
+SCAN_INTERVAL_SECONDS = 1800  # scan every 30 minutes
 
 # -----------------------------
 # Telegram sender
@@ -73,67 +72,32 @@ log.info(f"✅ Loaded {len(symbols)} symbols from CSV")
 # -----------------------------
 # Exchange detection helper
 # -----------------------------
+def parse_symbol(symbol: str):
+    """Splits exchange and symbol if present like NSE:RELIANCE"""
+    if ":" in symbol:
+        ex, sym = symbol.split(":", 1)
+        return ex.strip().upper(), sym.strip().upper()
+    ex = detect_exchange(symbol)
+    return ex, symbol.strip().upper()
+
 def detect_exchange(symbol: str) -> str:
-    # check csv EXCHANGE column first (case-insensitive match)
     if "EXCHANGE" in symbols_df.columns:
-        row = symbols_df.loc[symbols_df["SYMBOL"].astype(str).str.upper() == symbol.upper()]
+        row = symbols_df.loc[symbols_df["SYMBOL"] == symbol]
         if not row.empty:
             val = str(row["EXCHANGE"].iat[0]).strip().upper()
             if val:
                 return val
     s = symbol.upper()
-    known = {"BSE","INDEX","CAPITALCOM","TVC","IG","MCX","OANDA","NSE","NSEIX",
-             "SKILLING","SPREADEX","SZSE","VANTAGE"}
+    known = {"BSE", "INDEX", "CAPITALCOM", "TVC", "IG", "MCX", "OANDA", "NSE", "NSEIX",
+             "SKILLING", "SPREADEX", "SZSE", "VANTAGE"}
     for ex in known:
         if ex in s:
             return ex
-    if s.endswith(".NS") or s.endswith(":NSE") or s.endswith("-NS"):
+    if s.endswith(".NS"):
         return "NSE"
-    if s.endswith(".BO") or s.endswith(":BSE") or s.endswith("-BO"):
+    if s.endswith(".BO"):
         return "BSE"
-    # fallback
     return "NSE"
-
-# -----------------------------
-# Helper to safely parse symbol/exchange
-# -----------------------------
-def parse_symbol(raw_symbol: str):
-    """
-    Return tuple (exchange, symbol_clean)
-    Examples:
-      "NSE:RELIANCE" -> ("NSE", "RELIANCE")
-      "BSE:SENSEX"   -> ("BSE", "SENSEX")
-      "RELIANCE.NS"  -> ("NSE", "RELIANCE")
-      "GOLD1!"       -> ("MCX" or detected), "GOLD1!"
-    """
-    s = str(raw_symbol).strip()
-    if not s:
-        return ("NSE", s)
-
-    # If explicit prefix like EXCHANGE:SYMBOL
-    if ":" in s:
-        parts = s.split(":")
-        ex = parts[0].strip().upper()
-        sym = ":".join(parts[1:]).strip()  # join if extra colons
-        # clean symbol (remove accidental spaces)
-        return (ex, sym)
-
-    # handle suffix style like SYMBOL.NS or SYMBOL.BO
-    if s.upper().endswith(".NS"):
-        return ("NSE", s[:-3])
-    if s.upper().endswith(".BO"):
-        return ("BSE", s[:-3])
-
-    # sometimes tradingview uses -XX or .XX; handle some common cases
-    if s.endswith("-NS") or s.endswith("-BO"):
-        if s.endswith("-NS"):
-            return ("NSE", s[:-3])
-        if s.endswith("-BO"):
-            return ("BSE", s[:-3])
-
-    # else fallback to detect_exchange
-    ex = detect_exchange(s)
-    return (ex, s)
 
 # -----------------------------
 # Supertrend
@@ -171,33 +135,23 @@ def load_tv_session():
             with open(cookies_path, "r", encoding="utf-8") as f:
                 cookies_data = json.load(f)
             tvc = TvDatafeed()
-            # Inject cookies properly
-            try:
-                session = getattr(tvc, "session", None)
-                if session:
-                    for c in cookies_data:
-                        if isinstance(c, dict) and "name" in c and "value" in c:
-                            session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".tradingview.com"))
-                    log.info("✅ Cookies successfully injected into session.")
-            except Exception as e:
-                log.warning(f"⚠️ Could not inject cookies: {e}")
+            import requests
+            session = requests.Session()
+            for c in cookies_data:
+                if isinstance(c, dict) and "name" in c and "value" in c:
+                    session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".tradingview.com"))
+            tvc.session = session
+            log.info("✅ Cookies successfully injected into tvDatafeed session.")
+            test = tvc.get_hist("RELIANCE", "NSE", Interval.in_daily, 1)
+            if test is not None and not test.empty:
+                log.info("✅ Cookies login verified successfully.")
+                return tvc
 
-            # Test request
-            try:
-                test = tvc.get_hist("RELIANCE", "NSE", Interval.in_daily, 1)
-                if test is not None and not test.empty:
-                    log.info("✅ Cookies login verified successfully.")
-                    return tvc
-            except Exception as e:
-                log.warning(f"Cookies test failed: {e}")
-
-        # Username/password fallback
         if TV_USERNAME and TV_PASSWORD:
             tvc = TvDatafeed(username=TV_USERNAME, password=TV_PASSWORD)
             log.info("✅ TradingView login via username/password successful.")
             return tvc
 
-        # Final fallback
         tvc = TvDatafeed()
         log.warning("⚠️ Using nologin mode (limited data).")
         return tvc
@@ -214,22 +168,15 @@ tv = load_tv_session()
 def calculate_signals(symbol: str):
     global tv
     try:
-        original_symbol = symbol
         exchange, symbol_clean = parse_symbol(symbol)
-        # defensive strip
-        exchange = str(exchange).strip().upper()
-        symbol_clean = str(symbol_clean).strip()
-
         df = tv.get_hist(symbol=symbol_clean, exchange=exchange, interval=Interval.in_30_minute, n_bars=200)
         if df is None or df.empty:
-            log.debug(f"No data for {original_symbol} ({exchange}:{symbol_clean})")
             return
         df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
         for c in ["close", "high", "low"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(inplace=True)
         if len(df) < 50:
-            log.debug(f"Insufficient bars for {original_symbol} ({exchange}:{symbol_clean})")
             return
 
         ema20 = EMAIndicator(df["close"], 20).ema_indicator()
@@ -242,22 +189,20 @@ def calculate_signals(symbol: str):
         buy = (close_now > ema_now) and (close_now > super_now) and not ((close_prev > ema_prev) and (close_prev > super_prev))
         sell = (close_now < ema_now) and (close_now < super_now) and not ((close_prev < ema_prev) and (close_prev < super_prev))
 
-        display_symbol = f"{exchange}:{symbol_clean}"
-
         if buy:
             tp, sl = close_now + atr * 2, close_now - atr
             msg = (f"**PERFECT 5 SIGNAL - BUY**\n"
-                   f"Symbol: `{display_symbol}`\n"
+                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info(f"BUY → {display_symbol}")
+            log.info(f"BUY → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
 
         elif sell:
             tp, sl = close_now - atr * 2, close_now + atr
             msg = (f"**PERFECT 5 SIGNAL - SELL**\n"
-                   f"Symbol: `{display_symbol}`\n"
+                   f"Symbol: `{symbol_clean}`\nExchange: `{exchange}`\n"
                    f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTF: `30m`")
-            log.info(f"SELL → {display_symbol}")
+            log.info(f"SELL → {exchange}:{symbol_clean}")
             send_telegram_message(msg)
 
     except Exception as e:
@@ -275,68 +220,43 @@ def scan_loop():
         start = datetime.now()
         log.info(f"🔍 Starting scan at {start.strftime('%H:%M:%S')}")
         for sym in symbols:
-            try:
-                calculate_signals(sym)
-            except Exception as e:
-                log.exception(f"Exception while processing {sym}: {e}")
-            time.sleep(2)
+            calculate_signals(sym)
+            time.sleep(3)
         log.info(f"✅ Scan completed ({len(symbols)} symbols). Waiting {SCAN_INTERVAL_SECONDS}s...")
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 # -----------------------------
-# Flask healthcheck + keepalive
+# Flask + Keepalive
 # -----------------------------
-from flask import Flask, jsonify
-import threading
-import logging
-
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    """Root endpoint for Render and uptime pingers"""
     return jsonify({
         "status": "✅ MyPerfect5Bot is live on Render!",
-        "uptime": "OK",
-        "scanner": "running in background"
-    }), 200
+        "scanner": "running",
+        "uptime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 @app.route("/health")
 def health():
-    """Health check for uptime monitors"""
-    return "OK"
+    return "OK", 200
 
 @app.route("/ping")
 def ping():
-    """Simple ping route (used by uptime monitors like UptimeRobot)"""
     return "pong", 200
 
-# -----------------------------
-# Safe Flask + Background thread
-# -----------------------------
 def start_flask():
-    try:
-        logging.info(f"🌐 Starting Flask server on port {PORT} ...")
-        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-    except Exception as e:
-        logging.exception(f"Flask server crashed: {e}")
+    log.info(f"🌐 Starting Flask server on port {PORT} ...")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 def start_bot():
     try:
-        logging.info("🚀 Starting background scan loop ...")
         scan_loop()
     except Exception as e:
-        logging.exception(f"Background scanner crashed: {e}")
-        # optionally restart scanner
+        log.error(f"Scanner crashed: {e}")
         threading.Timer(60, start_bot).start()
 
-# -----------------------------
-# Launch both concurrently
-# -----------------------------
 if __name__ == "__main__":
-    # Start scanner in a separate thread
-    t = threading.Thread(target=start_bot, daemon=True)
-    t.start()
-
-    # Start Flask server (main thread)
+    threading.Thread(target=start_bot, daemon=True).start()
     start_flask()
