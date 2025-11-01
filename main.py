@@ -20,7 +20,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "3"))
+PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "5"))
 SLEEP_BETWEEN_SCANS = float(os.getenv("SLEEP_BETWEEN_SCANS", "180"))  # 3 minutes
 N_BARS = int(os.getenv("N_BARS", "96"))
 
@@ -67,43 +67,82 @@ except Exception as e:
 # -----------------------------
 # Strategy Signal Calculation
 # -----------------------------
-def calculate_signals(symbol_exchange: str):
+def calculate_signals(raw_symbol: str):
+    global tv
     try:
-        exchange, symbol = symbol_exchange.split(":")
-        df = tv.get_hist(symbol, exchange, interval=Interval.in_30_minute, n_bars=N_BARS)
+        ex_token, sym_token = parse_symbol(raw_symbol)
+        ex_token = (ex_token or "NSE")
+        sym_token = str(sym_token).strip()
+        if not sym_token:
+            return
+
+        # --- Get data ---
+        df, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
         if df is None or df.empty:
-            log.warning(f"⚠️ No data for {symbol_exchange}")
             return
 
-        df = df.dropna()
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-
-        atr = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range().iloc[-1]
-        close_now, close_prev = close.iloc[-1], close.iloc[-2]
-
-        # Dummy buy/sell condition
-        if close_now > close_prev * 1.002:
-            signal = "BUY"
-        elif close_now < close_prev * 0.998:
-            signal = "SELL"
-        else:
-            log.info(f"➡️ No new signal for {symbol_exchange}")
+        df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
+        for c in ["close", "high", "low"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.dropna(inplace=True)
+        if len(df) < 60:
             return
 
-        tp = close_now + atr * 3.0 if signal == "BUY" else close_now - atr * 3.0
-        sl = close_now - atr * 1.5 if signal == "BUY" else close_now + atr * 1.5
+        # --- Indicator calculations ---
+        ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
+        ema50 = EMAIndicator(df["close"], window=50).ema_indicator()
+        super_series, _ = compute_supertrend(df, period=10, multiplier=3.0)
+        atr_series = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
 
-        ist_time = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
-        msg = (f"**PERFECT 5 SIGNAL - {signal}**\n"
-               f"Symbol: `{symbol}`\nExchange: `{exchange}`\n"
-               f"Price: `{close_now:.2f}`\nTP: `{tp:.2f}`\nSL: `{sl:.2f}`\nTime: `{ist_time} IST`")
+        display = f"{used_ex or ex_token}:{sym_token}"
 
-        log.info(f"{signal} → {exchange}:{symbol}")
-        send_telegram_message(msg)
+        # --- Scan last 96 bars for signals ---
+        for i in range(1, len(df)):
+            close_now = df["close"].iat[i]
+            close_prev = df["close"].iat[i-1]
+            ema20_now, ema20_prev = ema20.iat[i], ema20.iat[i-1]
+            super_now, super_prev = super_series.iat[i], super_series.iat[i-1]
+            atr_now = atr_series.iat[i]
+            signal_time = df["datetime"].iat[i]
+            signal_time_ist = (signal_time + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
+
+            buy = (close_now > ema20_now) and (close_now > super_now) and not ((close_prev > ema20_prev) and (close_prev > super_prev))
+            sell = (close_now < ema20_now) and (close_now < super_now) and not ((close_prev < ema20_prev) and (close_prev < super_prev))
+
+            # --- BUY Signal ---
+            if buy:
+                tp = close_now + atr_now * 3.0
+                sl = close_now - atr_now * 1.5
+                msg = (
+                    f"**PERFECT 5 SIGNAL - BUY**\n"
+                    f"Symbol: `{display}`\n"
+                    f"Price: `{close_now:.2f}`\n"
+                    f"TP: `{tp:.2f}`\n"
+                    f"SL: `{sl:.2f}`\n"
+                    f"Time: `{signal_time_ist} IST`\n"
+                    f"TF: `30m`"
+                )
+                log.info(f"📈 BUY → {display} @ {signal_time_ist}")
+                send_telegram_message(msg)
+
+            # --- SELL Signal ---
+            if sell:
+                tp = close_now - atr_now * 3.0
+                sl = close_now + atr_now * 1.5
+                msg = (
+                    f"**PERFECT 5 SIGNAL - SELL**\n"
+                    f"Symbol: `{display}`\n"
+                    f"Price: `{close_now:.2f}`\n"
+                    f"TP: `{tp:.2f}`\n"
+                    f"SL: `{sl:.2f}`\n"
+                    f"Time: `{signal_time_ist} IST`\n"
+                    f"TF: `30m`"
+                )
+                log.info(f"📉 SELL → {display} @ {signal_time_ist}")
+                send_telegram_message(msg)
+
     except Exception as e:
-        log.error(f"❌ Error scanning {symbol_exchange}: {e}")
+        log.exception(f"Error processing {raw_symbol}: {e}")
 
 # -----------------------------
 # Main scan loop
