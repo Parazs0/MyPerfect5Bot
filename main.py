@@ -227,21 +227,60 @@ def scan_loop():
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 # -----------------------------
-# Flask healthcheck
+# Flask healthcheck + keepalive
 # -----------------------------
+from flask import Flask, jsonify
+import threading
+import logging
+
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ MyPerfect5Bot is live on Render!"
+    """Root endpoint for Render and uptime pingers"""
+    return jsonify({
+        "status": "✅ MyPerfect5Bot is live on Render!",
+        "uptime": "OK",
+        "scanner": "running in background"
+    }), 200
 
 @app.route("/health")
 def health():
+    """Health check for uptime monitors"""
     return "OK"
 
+@app.route("/ping")
+def ping():
+    """Simple ping route (used by uptime monitors like UptimeRobot)"""
+    return "pong", 200
+
 # -----------------------------
-# Launch
+# Safe Flask + Background thread
+# -----------------------------
+def start_flask():
+    try:
+        logging.info(f"🌐 Starting Flask server on port {PORT} ...")
+        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    except Exception as e:
+        logging.exception(f"Flask server crashed: {e}")
+
+def start_bot():
+    try:
+        logging.info("🚀 Starting background scan loop ...")
+        scan_loop()
+    except Exception as e:
+        logging.exception(f"Background scanner crashed: {e}")
+        # optionally restart scanner
+        threading.Timer(60, start_bot).start()
+
+# -----------------------------
+# Launch both concurrently
 # -----------------------------
 if __name__ == "__main__":
-    threading.Thread(target=scan_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    # Start scanner in a separate thread
+    t = threading.Thread(target=start_bot, daemon=True)
+    t.start()
+
+    # Start Flask server (main thread)
+    start_flask()
+
