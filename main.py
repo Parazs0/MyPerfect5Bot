@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CSV_PATH = os.getenv("CSV_PATH", "ALL_WATCHLIST_SYMBOLS.csv")
 PORT = int(os.getenv("PORT", 8000))
-PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "3"))  # seconds per symbol
+PAUSE_BETWEEN_SYMBOLS = float(os.getenv("PAUSE_BETWEEN_SYMBOLS", "4"))  # seconds per symbol
 SLEEP_BETWEEN_SCANS = float(os.getenv("SLEEP_BETWEEN_SCANS", "180"))  # seconds between full rounds
 N_BARS = int(os.getenv("N_BARS", "96"))  # last N bars to scan
 
@@ -201,12 +201,8 @@ def calculate_signals(raw_symbol: str):
         else:
             df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
-            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
-
-        for c in ["close", "high", "low"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
         df.dropna(subset=['datetime','close','high','low'], inplace=True)
+        df = df.sort_values('datetime').reset_index(drop=True)
         if len(df) < 10:
             return
 
@@ -216,13 +212,10 @@ def calculate_signals(raw_symbol: str):
         atr_series = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
         display = f"{used_ex or ex_token}:{sym_token}"
 
-        start_idx = max(1, len(df) - N_BARS)
-        end_idx = len(df)
+        # --- Detect latest signal only ---
+        signal_found = None
 
-        # --- Track only last signal ---
-        last_signal = None
-
-        for i in range(start_idx, end_idx):
+        for i in range(len(df) - 1, 0, -1):  # go backwards (latest first)
             try:
                 close_now = float(df["close"].iat[i])
                 close_prev = float(df["close"].iat[i-1])
@@ -240,31 +233,33 @@ def calculate_signals(raw_symbol: str):
                 sell = (close_now < ema20_now) and (close_now < super_now) and not ((close_prev < ema20_prev) and (close_prev < super_prev))
 
                 if buy or sell:
-                    # Convert time to IST string
-                    signal_time_ist = (
-                        (signal_time.tz_localize(None) if signal_time.tzinfo is None else signal_time.tz_convert(None))
-                        + timedelta(hours=5, minutes=30)
-                    ).strftime("%d-%b %H:%M")
-                    tp = close_now + atr_now * (3.0 if buy else -3.0)
-                    sl = close_now - atr_now * (1.5 if buy else -1.5)
-                    last_signal = ("BUY" if buy else "SELL", signal_time_ist, close_now, tp, sl)
+                    signal_found = ("BUY" if buy else "SELL", signal_time, close_now, atr_now)
+                    break  # 🟢 break immediately after finding latest signal
 
             except Exception as inner_e:
                 log.debug("Error evaluating bar %d for %s: %s", i, display, inner_e)
                 continue
 
-        # --- Send only last signal found in last 96 candles ---
-        if last_signal:
-            sig, t, price, tp, sl = last_signal
+        # --- Send latest signal ---
+        if signal_found:
+            sig, signal_time, price, atr_now = signal_found
+            signal_time_ist = (
+                (signal_time.tz_localize(None) if signal_time.tzinfo is None else signal_time.tz_convert(None))
+                + timedelta(hours=5, minutes=30)
+            ).strftime("%d-%b %H:%M")
+
+            tp = price + atr_now * (3.0 if sig == "BUY" else -3.0)
+            sl = price - atr_now * (1.5 if sig == "BUY" else -1.5)
+
             msg = (
                 f"**PERFECT 5 SIGNAL - {sig}**\n"
                 f"Symbol: `{display}`\n"
                 f"Price: `{price:.2f}`\n"
                 f"TP: `{tp:.2f}`\n"
                 f"SL: `{sl:.2f}`\n"
-                f"Time: `{t} IST`"
+                f"Time: `{signal_time_ist} IST`"
             )
-            log.info("📊 %s → %s @ %s", sig, display, t)
+            log.info("📊 %s → %s @ %s", sig, display, signal_time_ist)
             send_telegram_message(msg)
 
     except Exception as e:
