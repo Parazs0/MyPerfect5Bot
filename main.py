@@ -107,7 +107,7 @@ def calculate_signals(raw):
         ex, sym = parse_symbol(raw)
         if not sym or not is_market_open(ex): return
         df, used = try_get_hist(sym, ex, N_BARS)
-        if not df: return
+        if df is None or df.empty: return
 
         # normalize
         if 'datetime' not in df.columns: df['datetime'] = df.index
