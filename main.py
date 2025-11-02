@@ -171,9 +171,16 @@ def scan_loop():
 
 # ================== FLASK ==================
 app = Flask(__name__)
-@app.route("/"); return jsonify(status="Perfect5Bot OK")
-@app.route("/health"); return "OK"
+
+@app.route("/")
+def home():
+    return jsonify(status="Perfect5Bot OK", time=datetime.now(timezone.utc).isoformat())
+
+@app.route("/health")
+def health():
+    return "OK"
 
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+    app.run(host="0.0.0.0", port=os.getenv("PORT", 8000), use_reloader=False)
+    
