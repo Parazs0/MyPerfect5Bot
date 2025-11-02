@@ -1,4 +1,4 @@
-# main.py — Perfect5Bot: Market Hours Filter Updated (INDEX 24/7 for Global)
+# main.py — Perfect5Bot: Market Hours Filter Added (Full Exchanges)
 import os, base64, json, logging, threading, time
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
@@ -32,23 +32,23 @@ FALLBACK_EXCHANGES = ["NSE","BSE","MCX","TVC","INDEX","OANDA","SKILLING","CAPITA
 last_signal_sent = {}
 
 # -----------------------------
-# Market Timings (IST, Updated for INDEX 24/7 Global Rates)
+# Market Timings (IST, Mon-Fri unless specified) - Updated for All Exchanges
 # -----------------------------
 MARKET_TIMINGS = {
     "NSE": {"start": "09:15", "end": "15:30", "days": [0,1,2,3,4]},  # Mon-Fri
     "BSE": {"start": "09:00", "end": "15:30", "days": [0,1,2,3,4]},  # Mon-Fri
-    "MCX": {"start": "09:00", "end": "23:55", "days": [0,1,2,3,4]},  # Mon-Fri
+    "MCX": {"start": "09:00", "end": "23:55", "days": [0,1,2,3,4]},  # Mon-Sat
     "IG": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/5 Forex/CFDs
     "CAPITALCOM": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/5 CFDs
     "SPREADEX": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # Approx Mon-Fri (12:30PM-2:30AM IST)
     "TVC": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/7 Composites (Crypto/Indices vary)
-    "INDEX": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4,5,6]},  # 24/7 Global (Gold/Silver rates)
+    "INDEX": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4,5,6]},  # Default NSE/BSE
     "OANDA": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/5 Forex
     "NSEIX": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # NSE Indices (same as NSE)
     "SKILLING": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/5 CFD/Forex
-    "SZSE": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # Mon-Fri (CST to IST)
+    "SZSE": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # Mon-Fri (CST to IST: 9:30-11:30 + 13:00-14:57 CST)
     "VANTAGE": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]},  # 24/5 Forex/CFD
-    "DEFAULT": {"start": "00:00", "end": "23:59", "days": [0,1,2,3,4]}  # Fallback
+    "DEFAULT": {"start": "09:00", "end": "17:00", "days": [0,1,2,3,4]}  # Fallback
 }
 
 def is_market_open(exchange: str) -> bool:
@@ -235,7 +235,7 @@ def compute_supertrend(df, period=10, multiplier=3.0):
     return sup, dirn
 
 # -----------------------------
-# Strategy: Find LATEST crossover in last N_BARS
+# Strategy: Find LATEST crossover in last N_BARS (with Market Hours Check)
 # -----------------------------
 def calculate_signals(raw_symbol: str):
     global tv
@@ -244,6 +244,11 @@ def calculate_signals(raw_symbol: str):
         ex_token = ex_token or "NSE"
         sym_token = str(sym_token).strip()
         if not sym_token: return
+
+        # === MARKET HOURS CHECK ===
+        if not is_market_open(ex_token):
+            log.debug("Market closed for %s (%s) — skipping scan", raw_symbol, ex_token)
+            return
 
         df, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
         if df is None or df.empty:
@@ -413,4 +418,3 @@ def start_flask():
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
     start_flask()
-
