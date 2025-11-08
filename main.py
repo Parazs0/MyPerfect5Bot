@@ -243,102 +243,134 @@ def calculate_signals(raw_symbol: str):
         ex_token, sym_token = parse_symbol(raw_symbol)
         ex_token = ex_token or "NSE"
         sym_token = str(sym_token).strip()
-        if not sym_token:
-            return
+        if not sym_token: return
 
         # === MARKET HOURS CHECK ===
         if not is_market_open(ex_token):
-            log.debug("Market closed for %s (%s) — skipping", raw_symbol, ex_token)
+            log.debug("Market closed for %s (%s) — skipping scan", raw_symbol, ex_token)
             return
 
-        # === Download 5-min & 30-min data ===
-        df_5, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_5_minute, N_BARS * 6)
-        df_30, _ = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
-
-        if df_5 is None or df_5.empty or df_30 is None or df_30.empty:
+        df, used_ex = try_get_hist(tv, sym_token, ex_token, Interval.in_30_minute, N_BARS)
+        if df is None or df.empty:
+            log.debug("No data for %s", raw_symbol)
             return
 
-        # Normalize datetime
-        df_5 = df_5.copy().reset_index()
-        df_30 = df_30.copy().reset_index()
-        df_5.rename(columns={df_5.columns[0]: "datetime"}, inplace=True)
-        df_30.rename(columns={df_30.columns[0]: "datetime"}, inplace=True)
-        df_5["datetime"] = pd.to_datetime(df_5["datetime"])
-        df_30["datetime"] = pd.to_datetime(df_30["datetime"])
+        # Normalize
+        if 'datetime' not in df.columns:
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.copy()
+                df['datetime'] = df.index
+            else:
+                df = df.reset_index().rename(columns={df.columns[0]: "datetime"})
+        else:
+            df = df.loc[:, ~df.columns.duplicated()].copy()
 
-        # === Calculate 30-min indicators ===
-        ema20_30 = EMAIndicator(df_30["close"], window=20).ema_indicator()
-        super_30, _ = compute_supertrend(df_30, period=10, multiplier=3.0)
-        atr_30 = AverageTrueRange(df_30["high"], df_30["low"], df_30["close"], window=14).average_true_range()
-
-        df_30["ema20"] = ema20_30
-        df_30["supertrend"] = super_30
-        df_30["atr"] = atr_30
-
-        # === Merge 30-min data into 5-min ===
-        df_5 = pd.merge_asof(df_5.sort_values("datetime"),
-                             df_30[["datetime", "ema20", "supertrend", "atr"]].sort_values("datetime"),
-                             on="datetime")
-
-        if len(df_5) < 10:
+        if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+        for c in ["close", "high", "low"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.dropna(subset=['datetime','close','high','low'], inplace=True)
+        if len(df) < 10:
+            log.debug("Insufficient bars for %s (len=%d)", raw_symbol, len(df))
             return
+
+        # Indicators
+        ema20 = EMAIndicator(df["close"], window=20).ema_indicator()
+        super_series, _ = compute_supertrend(df, period=10, multiplier=3.0)
+        atr_series = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
 
         display = f"{used_ex or ex_token}:{sym_token}"
         key = f"{used_ex or ex_token}:{sym_token}"
 
-        # === Latest 5-min candle ===
-        close_now = df_5["close"].iloc[-1]
-        close_prev = df_5["close"].iloc[-2]
-        ema_now = df_5["ema20"].iloc[-1]
-        ema_prev = df_5["ema20"].iloc[-2]
-        st_now = df_5["supertrend"].iloc[-1]
-        st_prev = df_5["supertrend"].iloc[-2]
-        atr_now = df_5["atr"].iloc[-1]
-        signal_time = df_5["datetime"].iloc[-1]
+        # Find LATEST crossover
+        start_idx = max(1, len(df) - N_BARS)
+        end_idx = len(df)
 
-        # === Conditions (same as TradingView) ===
-        buy = (close_now > ema_now) and (close_now > st_now) and not ((close_prev > ema_prev) and (close_prev > st_prev))
-        sell = (close_now < ema_now) and (close_now < st_now) and not ((close_prev < ema_prev) and (close_prev < st_prev))
+        latest_buy = None
+        latest_sell = None
+        latest_time = None
 
-        if not (buy or sell):
-            return
+        for i in range(start_idx, end_idx):
+            try:
+                close_now = float(df["close"].iat[i])
+                close_prev = float(df["close"].iat[i-1])
+                ema20_now = float(ema20.iat[i]) if not pd.isna(ema20.iat[i]) else None
+                ema20_prev = float(ema20.iat[i-1]) if not pd.isna(ema20.iat[i-1]) else None
+                super_now = float(super_series.iat[i]) if not pd.isna(super_series.iat[i]) else None
+                super_prev = float(super_series.iat[i-1]) if not pd.isna(super_series.iat[i-1]) else None
+                atr_now = float(atr_series.iat[i]) if not pd.isna(atr_series.iat[i]) else 0.0
+                signal_time = df["datetime"].iat[i]
 
-        # === Time & Duplicate Filter ===
-        signal_time_ist = (signal_time + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
-        now = datetime.now()
-        if key in last_signal_sent and (now - last_signal_sent[key]).total_seconds() < 25 * 60:
-            log.debug("Duplicate skipped for %s", display)
-            return
-        last_signal_sent[key] = now
+                if ema20_now is None or ema20_prev is None or super_now is None or super_prev is None:
+                    continue
 
-        # === Send Telegram Message ===
-        if buy:
-            tp = close_now + atr_now * 4.5
-            sl = close_now - atr_now * 1.5
-            msg = (
-                f"**PERFECT 5 SIGNAL - BUY [5m Scan | 30m Logic]**\n"
-                f"Symbol: `{display}`\n"
-                f"Price: `{close_now:.2f}`\n"
-                f"TP: `{tp:.2f}`\n"
-                f"SL: `{sl:.2f}`\n"
-                f"Time: `{signal_time_ist} IST`"
-            )
-            log.info("BUY → %s @ %s", display, signal_time_ist)
-            send_telegram_message(msg)
+                buy = (close_now > ema20_now) and (close_now > super_now) and \
+                      not ((close_prev > ema20_prev) and (close_prev > super_prev))
 
-        elif sell:
-            tp = close_now - atr_now * 4.5
-            sl = close_now + atr_now * 1.5
-            msg = (
-                f"**PERFECT 5 SIGNAL - SELL [5m Scan | 30m Logic]**\n"
-                f"Symbol: `{display}`\n"
-                f"Price: `{close_now:.2f}`\n"
-                f"TP: `{tp:.2f}`\n"
-                f"SL: `{sl:.2f}`\n"
-                f"Time: `{signal_time_ist} IST`"
-            )
-            log.info("SELL → %s @ %s", display, signal_time_ist)
-            send_telegram_message(msg)
+                sell = (close_now < ema20_now) and (close_now < super_now) and \
+                       not ((close_prev < ema20_prev) and (close_prev < super_prev))
+
+                if buy or sell:
+                    current_time = signal_time if not pd.isna(signal_time) else datetime.utcnow()
+                    if latest_time is None or current_time > latest_time:
+                        latest_time = current_time
+                        if buy:
+                            latest_buy = (close_now, atr_now)
+                            latest_sell = None
+                        if sell:
+                            latest_sell = (close_now, atr_now)
+                            latest_buy = None
+
+            except Exception as e:
+                log.debug("Error in bar %d for %s: %s", i, display, e)
+                continue
+
+        # SEND ONLY LATEST SIGNAL
+        if latest_buy or latest_sell:
+            close_now, atr_now = (latest_buy or latest_sell)
+            is_buy = latest_buy is not None
+
+            if pd.isna(latest_time):
+                signal_time_ist = datetime.utcnow().strftime("%d-%b %H:%M")
+            else:
+                if latest_time.tzinfo is None:
+                    signal_time_utc = latest_time
+                else:
+                    signal_time_utc = latest_time.astimezone(timezone.utc).replace(tzinfo=None)
+                signal_time_ist = (signal_time_utc + timedelta(hours=5, minutes=30)).strftime("%d-%b %H:%M")
+
+            now = datetime.now()
+            if key in last_signal_sent and (now - last_signal_sent[key]).total_seconds() < 25 * 60:
+                log.debug("Duplicate signal skipped for %s", display)
+                return
+            last_signal_sent[key] = now
+
+            if is_buy:
+                tp = close_now + atr_now * 4.5
+                sl = close_now - atr_now * 1.5
+                msg = (
+                    f"**PERFECT 5 SIGNAL - BUY**\n"
+                    f"Symbol: `{display}`\n"
+                    f"Price: `{close_now:.2f}`\n"
+                    f"TP: `{tp:.2f}`\n"
+                    f"SL: `{sl:.2f}`\n"
+                    f"Time: `{signal_time_ist} IST`"
+                )
+                log.info("LATEST BUY → %s @ %s", display, signal_time_ist)
+                send_telegram_message(msg)
+            else:
+                tp = close_now - atr_now * 4.5
+                sl = close_now + atr_now * 1.5
+                msg = (
+                    f"**PERFECT 5 SIGNAL - SELL**\n"
+                    f"Symbol: `{display}`\n"
+                    f"Price: `{close_now:.2f}`\n"
+                    f"TP: `{tp:.2f}`\n"
+                    f"SL: `{sl:.2f}`\n"
+                    f"Time: `{signal_time_ist} IST`"
+                )
+                log.info("LATEST SELL → %s @ %s", display, signal_time_ist)
+                send_telegram_message(msg)
 
     except Exception as e:
         log.exception("Error processing %s: %s", raw_symbol, e)
@@ -385,4 +417,4 @@ def start_flask():
 # -----------------------------
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
-    start_flask()
+    start_flask()
